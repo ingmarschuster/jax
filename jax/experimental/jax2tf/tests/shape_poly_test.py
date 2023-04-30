@@ -2779,9 +2779,13 @@ class ShapePolyPrimitivesTest(tf_test_util.JaxToTfTestCase):
         # https://github.com/openxla/stablehlo/issues/1344: need DynamicRngBitGenerator
         raise unittest.SkipTest("native lowering with shape polymorphism not implemented for rng_bit_generator")
 
-      if "top_k" in harness.fullname:
+      if "top_k" in harness.fullname and "approx_top_k" not in harness.fullname:
         # https://github.com/openxla/stablehlo/issues/1255: need DynamicTopK
         raise unittest.SkipTest("native lowering with shape polymorphism not implemented for top_k")
+
+      if "approx_top_k" in harness.fullname:
+        if xla_client.mlir_api_version < 50:
+          raise unittest.SkipTest("native lowering with shape polymorphism only implemented for approx_top_k in jaxlib >= 0.4.11")
 
       if (jtu.device_under_test() in ["tpu", "gpu"] and
           harness.fullname in [
