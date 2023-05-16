@@ -392,6 +392,7 @@ pybind_extension(
     module_name = "_triton",
     deps = [
         ":cuda_vendor",
+        "@xla//xla/service:custom_call_status",
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",

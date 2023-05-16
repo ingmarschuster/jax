@@ -8,6 +8,8 @@
 #include <variant>
 #include <vector>
 
+#include "pybind11/pybind11.h"
+#include "pybind11/stl.h"
 #include "absl/base/call_once.h"
 #include "absl/base/optimization.h"
 #include "absl/cleanup/cleanup.h"
@@ -20,8 +22,7 @@
 #include "absl/synchronization/mutex.h"
 #include "jaxlib/gpu/vendor.h"
 #include "pybind11_abseil/status_casters.h"  // IWYU pragma: keep
-#include "pybind11/pybind11.h"
-#include "pybind11/stl.h"
+#include "xla/service/custom_call_status.h"
 
 #define RETURN_IF_ERROR(expr)               \
   do {                                      \
@@ -394,13 +395,16 @@ absl::StatusOr<uint64_t> EncodeKernelParameter(py::bool_ value,
 
 }  // namespace
 
-void LaunchTritonKernel(CUstream stream, void** buffers, char* opaque,
-                        size_t opaque_len) {
+void LaunchTritonKernel(CUstream stream, void** buffers, const char* opaque,
+                        size_t opaque_len, XlaCustomCallStatus* status) {
   CHECK_EQ(opaque_len, sizeof(TritonKernelCallBase*));
   TritonKernelCallBase* kernel_call;
   std::memcpy(&kernel_call, opaque, sizeof(TritonKernelCallBase*));
-  absl::Status status = kernel_call->Launch(stream, buffers);
-  LOG_IF(FATAL, !status.ok()) << status;  // TODO(cjfj): Return the `Status`.
+  absl::Status result = kernel_call->Launch(stream, buffers);
+  if (!result.ok()) {
+    absl::string_view msg = result.message();
+    XlaCustomCallStatusSetFailure(status, msg.data(), msg.length());
+  }
 }
 
 PYBIND11_MODULE(_triton, m) {
