@@ -796,6 +796,15 @@ pmap_shmap_merge = config.define_bool_state(
     help='If True, pmap and shard_map API will be merged.')
 
 
+cpp_pjit_call_impl = config.define_bool_state(
+    name='jax_cpp_pjit_call_impl',
+    default=False,
+    upgrade=True,
+    help=("If True, pjit's impl rule will take the C++ fast dispatch. This is "
+          "useful when some API's call pjit_call_impl directly instead of "
+          "going via pjit function (for example jaxpr_as_fun)."))
+
+
 spmd_mode = config.define_enum_state(
     name='jax_spmd_mode',
     enum_values=['allow_all', 'allow_jit', 'allow_pjit'],

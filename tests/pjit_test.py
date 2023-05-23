@@ -36,6 +36,7 @@ from jax import stages
 from jax.errors import JAXTypeError
 from jax import lax
 from jax.lax import with_sharding_constraint
+from jax._src import config as config_internal
 from jax._src import prng
 from jax.sharding import PartitionSpec as P
 from jax.experimental.maps import xmap
@@ -3445,6 +3446,21 @@ class ArrayPjitTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(
         ValueError, "Received incompatible devices for jitted computation"):
       with_sharding_constraint(inp, NamedSharding(mesh2, P('x')))
+
+  @config_internal.cpp_pjit_call_impl(True)
+  def test_jaxpr_as_fun_fast_path(self):
+    @jax.jit
+    def f(x):
+      return x * 2
+    inp = jax.device_put(jnp.arange(8), jax.devices()[0])
+    jaxpr = jax.make_jaxpr(f)(inp)
+
+    with jtu.count_pjit_cpp_cache_miss() as count:
+      out1 = core.jaxpr_as_fun(jaxpr)(inp)
+      out2 = core.jaxpr_as_fun(jaxpr)(inp)
+    self.assertEqual(count[0], 1)
+    self.assertArraysEqual(out1[0], inp * 2)
+    self.assertArraysEqual(out2[0], inp * 2)
 
 
 class TempSharding(Sharding):
