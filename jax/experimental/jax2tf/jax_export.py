@@ -76,6 +76,9 @@ class Exported:
     module_kept_var_idx: the sorted indices of the arguments among `in_avals` that
         must be passed to the module. The other arguments have been dropped
         because they are not used. Same length as `in_shardings`.
+    module_uses_dim_vars: whether the `mlir_module_serialized` uses shape
+        polymorphic dimension variables. This may be from `in_avals` but also
+        from inner calls of Exported modules.
     strict_checks: whether the module was serialized with the following safety
         checking: (A) the lowered computation can only be executed on a platform
         for which it was lowered; (B) the serialized computation contains only
@@ -101,6 +104,7 @@ class Exported:
   mlir_module_serialized: bytes
   xla_call_module_version: int
   module_kept_var_idx: Tuple[int, ...]
+  module_uses_dim_vars: bool
 
   _get_vjp: Optional[Callable[["Exported"], "Exported"]]
 
@@ -182,7 +186,7 @@ def poly_specs(
       [the README](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#shape-polymorphic-conversion)
       for more details.
 
-  Returns: a pytree of jax.ShapeDTypeStruct mathcing `args`.
+  Returns: a pytree of jax.ShapeDTypeStruct matching `args`.
   """
   args_flat, args_tree = tree_util.tree_flatten(args)
 
@@ -264,10 +268,9 @@ def export(fun_jax: Callable,
     else:
       # For pmap
       module_kept_var_idx = tuple(range(len(args_avals_flat)))
-
-    if not all(
-        core.is_constant_shape(a.shape) for a in args_avals_flat
-    ) or lowering.compile_args.get("ordered_effects", []):
+    shape_poly_state = lowering.compile_args["shape_poly_state"]
+    if (not all(core.is_constant_shape(a.shape) for a in args_avals_flat)
+        or lowering.compile_args.get("ordered_effects", [])):
       # All arguments are kept if we have dimension variables.
       assert len(module_kept_var_idx) == len(args_avals_flat)
       mlir_module = _wrap_main_func(
@@ -334,6 +337,7 @@ def export(fun_jax: Callable,
         strict_checks=strict_checks,
         mlir_module_serialized=mlir_module_serialized,
         module_kept_var_idx=module_kept_var_idx,
+        module_uses_dim_vars=shape_poly_state.uses_dim_vars,
         xla_call_module_version=xla_call_module_version,
         _get_vjp=lambda exported: _export_native_vjp(fun_jax, exported))
 
@@ -387,7 +391,6 @@ def _wrap_main_func(
   Returns the wrapped module.
   """
   dim_vars = shape_poly.all_dim_vars(args_avals_flat)
-
   # Make a new module, do not mutate the "module" because it may be cached
   context = mlir.make_ir_context()
   with context, ir.Location.unknown(context):
@@ -483,12 +486,11 @@ def _compute_dim_args(
     the values of the dimension variables, in the sorted order of the
     dimension variables.
   """
-  dim_vars = shape_poly.all_dim_vars(args_avals_flat)
   dim_values = mlir.lower_fun(
-      functools.partial(shape_poly.unify_avals_with_args, args_avals_flat, dim_vars,
-                        use_static_dimension_size=False,
-                        args_kwargs_tree=args_kwargs_tree),
+      functools.partial(shape_poly.compute_dim_vars_from_arg_shapes,
+                        args_avals_flat, args_kwargs_tree=args_kwargs_tree),
       multiple_results=True)(ctx, *array_args)
+
   res = []
   for dim_arg, dim_arg_type in zip(util.flatten(dim_values), dim_arg_types):
     if dim_arg.type != dim_arg_type:
@@ -513,7 +515,7 @@ def _check_lowering(lowering) -> None:
       "spmd_lowering", "auto_spmd_lowering",
       "tuple_args", "ordered_effects", "unordered_effects",
       "keepalive", "host_callbacks", "pmap_nreps", "committed",
-      "device_assignment", "jaxpr_debug_info"]
+      "device_assignment", "jaxpr_debug_info", "shape_poly_state"]
   for compile_arg in lowering.compile_args.keys():
     if compile_arg not in allowed_compile_args:
       raise NotImplementedError(f"Unrecognized lowered.compile_args[{compile_arg}]")
@@ -539,6 +541,7 @@ def _check_lowering(lowering) -> None:
       # used on all platforms for callbacks. Not supported yet.
       ("keepalive", lambda v: not v, "empty"),
       ("pmap_nreps", lambda v: v == 1, "1"),
+      ("shape_poly_state", lambda v: True, "N/A"),
   ):
     if compile_arg in lowering.compile_args:
       if not check_value(lowering.compile_args[compile_arg]):
@@ -578,6 +581,7 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = [
     "LuDecomposition",
     # ApproxTopK on TPU
     "ApproxTopK",
+    "tf.call_tf_function",  # From jax2tf.call_tf(func, call_tf_graph=True)
 ]
 
 def _check_module(mod: ir.Module, *,
@@ -752,18 +756,48 @@ def call_exported(exported: Exported) -> Callable[..., jax.Array]:
 call_exported_p = core.Primitive("call_exported")
 call_exported_p.multiple_results = True
 
+@util.cache()
 def _call_exported_abstract_eval(*in_avals: core.AbstractValue,
                                  exported: Exported) -> Tuple[core.AbstractValue, ...]:
   exported_dim_vars = shape_poly.all_dim_vars(exported.in_avals)
-  if exported_dim_vars:
-    raise NotImplementedError("call_exported for exported with polymorphic shapes")
   assert len(in_avals) == len(exported.in_avals)  # since the pytrees have the same structure
+  # Check that the expected shapes match the actual ones
+  for arg_idx, (exp_aval, actual_aval) in enumerate(zip(exported.in_avals, in_avals)):
+    def pp_arg_dim(dim_idx: Optional[int]) -> str:
+      return shape_poly.pretty_print_dimension_descriptor(exported.in_tree,
+                                                          arg_idx, dim_idx)
+    if len(exp_aval.shape) != len(actual_aval.shape):
+      raise ValueError(
+          f"Rank mismatch for {pp_arg_dim(None)}: expected {exp_aval.shape} "
+          f"and called with {actual_aval.shape}")
+    if exp_aval.dtype != actual_aval.dtype:
+      raise ValueError(
+          f"Dtype mismatch for {pp_arg_dim(None)}: expected {exp_aval.dtype} "
+          f"and called with {actual_aval.dtype}")
+    for dim_idx, aval_d in enumerate(exp_aval.shape):
+      # If the exp_aval has a constant dimension then the actual argument must have
+      # a matching constant dimension.
+      if core.is_constant_dim(aval_d):
+        if (not core.is_constant_dim(actual_aval.shape[dim_idx]) or
+            aval_d != actual_aval.shape[dim_idx]):
+          raise ValueError(
+              f"Shape mismatch for {pp_arg_dim(dim_idx)} (expected constant): "
+              f"expected {exp_aval.shape} and called with {actual_aval.shape}")
+
   # Must express the exported_dim_vars in terms of the shapes in in_avals.
-  _ = shape_poly.unify_avals_with_args(
-      exported.in_avals, exported_dim_vars, *in_avals,  # type: ignore
-      use_static_dimension_size=True,
-      args_kwargs_tree=exported.in_tree)
-  return exported.out_avals
+  solution, shape_constraints, known_dim_vars = shape_poly.solve_dim_vars(
+      exported.in_avals, args_kwargs_tree=exported.in_tree)
+  known_env = {vname: in_avals[arg_idx].shape[dim_idx]
+               for (vname, arg_idx, dim_idx) in known_dim_vars}
+  shape_constraints.check(known_env)
+  exported_dim_values = [solution[var].evaluate(known_env)
+                         for var in exported_dim_vars]
+  return tuple(
+      core.ShapedArray(core.evaluate_shape(out_aval.shape, exported_dim_vars,
+                                           *exported_dim_values),
+                       dtype=out_aval.dtype, weak_type=out_aval.weak_type,
+                       named_shape=out_aval.named_shape)
+      for out_aval in exported.out_avals)
 
 
 call_exported_p.def_abstract_eval(_call_exported_abstract_eval)
@@ -781,18 +815,37 @@ def _call_exported_lowering(ctx: mlir.LoweringRuleContext, *args,
         f"The exported function '{exported.fun_name}' was lowered for "
         f"platform '{exported.lowering_platform}' but it is used "
         f"on '{platform}'.")
+  if any(not core.is_constant_shape(a.shape) for a in exported.in_avals):
+    ctx.module_context.shape_poly_state.uses_dim_vars = True
+
   submodule = ir.Module.parse(exported.mlir_module)
   symtab = ir.SymbolTable(submodule.operation)
+  # The called function may have been exported with polymorphic shapes and called
+  # now with more refined shapes. We insert hlo.ConvertOp to ensure the module
+  # is valid.
+  def convert_shape(x: ir.Value, x_aval: core.AbstractValue, new_aval: core.AbstractValue) -> ir.Value:
+    new_ir_type = mlir.aval_to_ir_type(new_aval)
+    if x.type != new_ir_type:
+      return mlir.convert_hlo(ctx, x, x_aval, new_aval)
+    else:
+      return x
+
   callee_result_types = symtab["main"].type.results
   # TODO: maybe cache multiple calls
   fn = mlir.merge_mlir_modules(ctx.module_context.module,
                                f"call_exported_{exported.fun_name}",
                                submodule)
-  kept_args = [a for i, a in enumerate(args) if i in exported.module_kept_var_idx]
+  kept_args = [
+      convert_shape(a, a_aval, exported_in_aval)
+      for i, (a, a_aval, exported_in_aval) in enumerate(zip(args, ctx.avals_in, exported.in_avals))
+      if i in exported.module_kept_var_idx]
   call = func_dialect.CallOp(callee_result_types,
                              ir.FlatSymbolRefAttr.get(fn),
                              kept_args)
-  return call.results
+  # The ctx.avals_out already contain the abstract values refined by
+  # _call_exported_abstract_eval.
+  return tuple(convert_shape(out, out_aval, refined_out_aval)
+               for out, out_aval, refined_out_aval in zip(call.results, exported.out_avals, ctx.avals_out))
 
 
 for _p in ("cpu", "tpu", "cuda", "rocm"):

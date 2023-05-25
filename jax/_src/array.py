@@ -18,8 +18,8 @@ import math
 import operator as op
 import numpy as np
 import functools
-from typing import (Sequence, Tuple, Callable, Optional, List, cast, Set,
-                    TYPE_CHECKING)
+from typing import (Any, Callable, List, Optional, Sequence, Set, Tuple,
+                    Union, cast, TYPE_CHECKING)
 
 from jax._src import abstract_arrays
 from jax._src import api
@@ -32,7 +32,6 @@ from jax._src import profiler
 from jax._src import xla_bridge
 from jax._src.config import config
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension_version
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.interpreters import xla
@@ -46,6 +45,7 @@ from jax._src.util import use_cpp_class, use_cpp_method
 Shape = Tuple[int, ...]
 Device = xc.Device
 Index = Tuple[slice, ...]
+PRNGKeyArrayImpl = Any  # TODO(jakevdp): fix cycles and import this.
 
 
 class Shard:
@@ -61,7 +61,7 @@ class Shard:
   """
 
   def __init__(self, device: Device, sharding: Sharding, global_shape: Shape,
-               data: Optional[ArrayImpl] = None):
+               data: Union[None, ArrayImpl, PRNGKeyArrayImpl] = None):
     self._device = device
     self._sharding = sharding
     self._global_shape = global_shape
@@ -425,7 +425,7 @@ class ArrayImpl(basearray.Array):
 
   def addressable_data(self, index: int) -> ArrayImpl:
     self._check_if_deleted()
-    if self.is_fully_replicated and xla_extension_version >= 148:
+    if self.is_fully_replicated:
       return self._fully_replicated_shard()
     return self._arrays[index]
 
@@ -646,14 +646,13 @@ def make_array_from_single_device_arrays(
     i.e. each process receives a different part of the data, then you can use
     `make_array_from_single_device_arrays` to create a global jax.Array
 
-    >>> global_shape = (8, 2)
-    >>> host_array = np.arange(math.prod(global_shape)).reshape(global_shape)
+    >>> local_shape = (8, 2)
+    >>> global_shape = (jax.process_count() * local_shape[0], ) + local_shape[1:]
+    >>> local_array = np.arange(math.prod(local_shape)).reshape(local_shape)
     >>> arrays = jax.device_put(
-    ...   np.split(host_array, len(global_mesh.local_devices), axis=0),
-    ...   global_mesh.local_devices)
-    >>> arr = jax.make_array_from_single_device_arrays(
-    ...   global_shape, jax.sharding.NamedSharding(global_mesh, P(('x', 'y'))),
-    ...   arrays)
+    ...   np.split(local_array, len(global_mesh.local_devices), axis = 0), global_mesh.local_devices)
+    >>> sharding = jax.sharding.NamedSharding(global_mesh, P(('x', 'y'), ))
+    >>> arr = jax.make_array_from_single_device_arrays(global_shape, sharding, arrays)
     >>> arr.addressable_data(0).shape
     (1, 2)
   """

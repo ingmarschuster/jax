@@ -6,24 +6,50 @@ Best viewed [here](https://jax.readthedocs.io/en/latest/changelog.html).
 Remember to align the itemized text with the first line of an item within a list.
 -->
 
-## jax 0.4.11
+## jax 0.4.12
 
 * Deprecations
   * The following APIs have been removed after a 3 month deprecation period, in
     accordance with the {ref}`api-compatibility` policy:
-    - `jax.experimental.PartitionSpec`: use `jax.sharding.PartitionSpec`.
-    - `jax.experimental.maps.Mesh`: use `jax.sharding.Mesh`
-    - `jax.experimental.pjit.NamedSharding`: use `jax.sharding.NamedSharding`.
-    - `jax.experimental.pjit.PartitionSpec`: use `jax.sharding.PartitionSpec`.
-    - `jax.experimental.pjit.FROM_GDA`. Instead pass sharded `jax.Array` objects
+    * `jax.numpy.alltrue`: use `jax.numpy.all`. This follows the deprecation
+      of `numpy.alltrue` in NumPy version 1.25.0.
+    * `jax.numpy.sometrue`: use `jax.numpy.any`. This follows the deprecation
+      of `numpy.sometrue` in NumPy version 1.25.0.
+    * `jax.numpy.product`: use `jax.numpy.prod`. This follows the deprecation
+      of `numpy.product` in NumPy version 1.25.0.
+    * `jax.numpy.cumproduct`: use `jax.numpy.cumprod`. This follows the deprecation
+      of `numpy.cumproduct` in NumPy version 1.25.0.
+
+## jaxlib 0.4.12
+
+* Changes
+  * Include PTX/SASS for Hopper (SM version 9.0+) GPUs. Previous
+    versions of jaxlib should work on Hopper but would have a long
+    JIT-compilation delay the first time a JAX operation was executed.
+
+## jax 0.4.11 (May 31, 2023)
+
+* Deprecations
+  * The following APIs have been removed after a 3 month deprecation period, in
+    accordance with the {ref}`api-compatibility` policy:
+    * `jax.experimental.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.experimental.maps.Mesh`: use `jax.sharding.Mesh`
+    * `jax.experimental.pjit.NamedSharding`: use `jax.sharding.NamedSharding`.
+    * `jax.experimental.pjit.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.experimental.pjit.FROM_GDA`. Instead pass sharded `jax.Array` objects
       as input and remove the optional `in_shardings` argument to `pjit`.
-    - `jax.interpreters.pxla.PartitionSpec`: use `jax.sharding.PartitionSpec`.
-    - `jax.interpreters.pxla.Mesh`: use `jax.sharding.Mesh`
-    - `jax.interpreters.xla.Device`: use `jax.Device`.
-    - `jax.interpreters.xla.DeviceArray`: use `jax.Array` instead,
+    * `jax.interpreters.pxla.PartitionSpec`: use `jax.sharding.PartitionSpec`.
+    * `jax.interpreters.pxla.Mesh`: use `jax.sharding.Mesh`
+    * `jax.interpreters.xla.Buffer`: use `jax.Array`.
+    * `jax.interpreters.xla.Device`: use `jax.Device`.
+    * `jax.interpreters.xla.DeviceArray`: use `jax.Array`.
+    * `jax.interpreters.xla.device_put`: use `jax.device_put`.
+    * `jax.interpreters.xla.xla_call_p`: use `jax.experimental.pjit.pjit_p`.
+    * `axis_resources` argument of `with_sharding_constraint` is removed. Please
+      use `shardings` instead.
 
 
-## jaxlib 0.4.11
+## jaxlib 0.4.11 (May 31, 2023)
 
 * Changes
   * Readded support for the Python buffer protocol (`memoryview`) on CPU

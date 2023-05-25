@@ -194,10 +194,10 @@ class _ThreadLocalState(threading.local):
     # "{tf_outer_name_scope}/JAX_NAME_STACKS"
     self.tf_outer_name_scope = ""
 
-    # A set collecting all tf concrete_functions called by stablehlo.custom_call
-    # This is used only by native serialization ((unlike all the other
+    # A dict collecting all tf concrete_functions called by stablehlo.custom_call
+    # This is used only by native serialization (unlike all the other
     # thread-local state).
-    self.call_tf_concrete_function_set: set[Any] = set()
+    self.call_tf_concrete_function_list: Optional[List[Any]] = None
 
 _thread_local_state = _ThreadLocalState()
 
@@ -215,11 +215,10 @@ def inside_call_tf():
     _thread_local_state.inside_call_tf = prev
 
 
-def add_to_call_tf_concrete_function_set(func_list: List[Any]) -> None:
-  assert (
-      _thread_local_state.inside_call_tf
-  ), "Updating call_tf_concrete_function_set can only happen inside call_tf."
-  _thread_local_state.call_tf_concrete_function_set.update(func_list)
+def get_thread_local_state_call_tf_concrete_function_list() -> (
+    Optional[List[Any]]
+):
+  return _thread_local_state.call_tf_concrete_function_list
 
 
 @partial(api_util.api_hook, tag="jax2tf_convert")
@@ -494,10 +493,11 @@ class NativeSerializationImpl(SerializationImpl):
       self.lowering_platform = None
 
   def before_conversion(self):
-    _thread_local_state.call_tf_concrete_function_set = set()
+    _prev_func_list = _thread_local_state.call_tf_concrete_function_list
+    _thread_local_state.call_tf_concrete_function_list = []
 
     def _restore_context():
-      _thread_local_state.call_tf_concrete_function_set.clear()
+      _thread_local_state.call_tf_concrete_function_list = _prev_func_list
 
     self._restore_context = _restore_context
     self.exported = jax_export.export(
@@ -563,9 +563,8 @@ class GraphSerializationImpl(SerializationImpl):
         map(lambda a: core.raise_to_shaped(core.get_aval(a)), args_specs_flat))
     dim_vars = shape_poly.all_dim_vars(self.args_avals_flat)
     dim_values, _ = _interpret_fun_jax(
-        partial(shape_poly.unify_avals_with_args, self.args_avals_flat, dim_vars,
-                use_static_dimension_size=False,
-                args_kwargs_tree=self.in_tree),
+        partial(shape_poly.compute_dim_vars_from_arg_shapes,
+                self.args_avals_flat, args_kwargs_tree=self.in_tree),
         self.args_flat_tf, self.args_avals_flat, self.name_stack)
     _thread_local_state.shape_env = zip(dim_vars, dim_values)
 
@@ -838,8 +837,8 @@ def _run_exported_as_tf(args_flat_tf: Sequence[TfVal],
       Sout=out_shapes_tf,
       function_list=[
           concrete_fn.function_def.signature.name
-          for concrete_fn in _thread_local_state.call_tf_concrete_function_set
-      ],
+          for concrete_fn in _thread_local_state.call_tf_concrete_function_list
+      ] if _thread_local_state.call_tf_concrete_function_list is not None else [],
   )
 
   if exported.xla_call_module_version >= 3:
@@ -870,10 +869,11 @@ def _run_exported_as_tf(args_flat_tf: Sequence[TfVal],
   # TODO(b/278940799): Replace the TF v1 API with public TF2 API.
   # Add the custom call tf.function into the default graph, so those functions
   # will be available during tf.SavedModel.save.
-  for concrete_fn in _thread_local_state.call_tf_concrete_function_set:
-    tf.compat.v1.get_default_graph()._add_function_recursive(
-        concrete_fn._inference_function
-    )
+  if _thread_local_state.call_tf_concrete_function_list is not None:
+    for concrete_fn in _thread_local_state.call_tf_concrete_function_list:
+      tf.compat.v1.get_default_graph()._add_function_recursive(
+          concrete_fn._inference_function
+      )
 
   if exported.out_shardings is not None:
     res = list(map(partial(_shard_value, skip_replicated_sharding=tf.executing_eagerly()),
@@ -1244,8 +1244,8 @@ class TensorFlowTrace(core.Trace):
         return val
     tf_val, jax_dtype = _tfval_to_tensor_jax_dtype(val, memoize_constants=True)
     return TensorFlowTracer(
-        self, val, core.ShapedArray(tf_val.shape, jax_dtype,
-                                    weak_type=dtypes.is_weakly_typed(val)))
+        self, tf_val, core.ShapedArray(np.shape(val), jax_dtype,
+                                       weak_type=dtypes.is_weakly_typed(val)))
 
   def lift(self, val: core.Tracer) -> TensorFlowTracer:
     # This would be called when we need to raise a tracer from a lower-level
@@ -1923,7 +1923,7 @@ tf_impl_with_avals[lax.clamp_p] = _clamp
 
 
 def _concatenate(*operands, dimension):
-  return tf.concat(operands, axis=dimension)
+  return tf.concat(operands, axis=tf.cast(dimension, tf.int32))
 
 
 tf_impl[lax.concatenate_p] = _concatenate

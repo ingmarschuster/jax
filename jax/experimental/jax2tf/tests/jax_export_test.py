@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-import re
+import logging
+import math
+from typing import List
 import unittest
 
 from absl.testing import absltest, parameterized
-
 import jax
-from jax import tree_util
-
 from jax import numpy as jnp
+from jax import tree_util
 from jax.config import config
 from jax.experimental.jax2tf import jax_export
+try:
+  from jax.experimental.jax2tf import jax2tf  # TODO: temporary
+except ImportError:
+  jax2tf = None  # type: ignore
+
 from jax._src import core
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
@@ -64,13 +69,25 @@ class JaxExportTest(jtu.JaxTestCase):
 
   def test_poly_export_only(self):
     a = np.arange(12, dtype=np.float32).reshape((3, 4))
-    def f(a):
-      return jnp.concatenate([a, a], axis=0)
+    def f(a, b):  # a: f32[2w,h]  b: f32[w,h]
+      return jnp.concatenate([a, b], axis=0)
 
     exp = jax_export.export(f)(
+        jax_export.poly_spec(a.shape, a.dtype, "(2*w, h)"),
         jax_export.poly_spec(a.shape, a.dtype, "(w, h)"))
+    self.assertEqual("(2*w, h)", str(exp.in_avals[0].shape))
+    self.assertEqual("(w, h)", str(exp.in_avals[1].shape))
+    self.assertEqual("(3*w, h)", str(exp.out_avals[0].shape))
+
+  def test_poly_pytree_export_only(self):
+    a = np.arange(12, dtype=np.float32).reshape((3, 4))
+    def f(a0, a1, *, ak):
+      return jnp.concatenate([a0, a1, ak], axis=0)
+
+    a_poly_spec = jax_export.poly_spec(a.shape, a.dtype, "(w, h)")
+    exp = jax_export.export(f)(a_poly_spec, a_poly_spec, ak=a_poly_spec)
     self.assertEqual("(w, h)", str(exp.in_avals[0].shape))
-    self.assertEqual("(2*w, h)", str(exp.out_avals[0].shape))
+    self.assertEqual("(3*w, h)", str(exp.out_avals[0].shape))
 
   def test_basic(self):
     f = jnp.sin
@@ -137,11 +154,11 @@ class JaxExportTest(jtu.JaxTestCase):
     exp_f = jax_export.export(f)(f32_4, b=f32_4)
 
     with self.assertRaisesRegex(ValueError,
-        r"Shape mismatch for args\[0\] in dimension 0"):
+        r"Shape mismatch for args\[0\].shape\[0\]"):
       jax_export.call_exported(exp_f)(np.arange(6, dtype=np.float32), b=f32_4)
 
     with self.assertRaisesRegex(ValueError,
-        r"Shape mismatch for kwargs\['b'\] in dimension 0"):
+        r"Shape mismatch for kwargs\['b'\].shape\[0\]"):
       jax_export.call_exported(exp_f)(f32_4, b=np.arange(6, dtype=np.float32))
 
     with self.assertRaisesRegex(ValueError,
@@ -208,14 +225,149 @@ class JaxExportTest(jtu.JaxTestCase):
     self.assertAllClose(jnp.cos(jnp.sin(jnp.sin(a))),
                         jax_export.call_exported(exp_f2)(a))
 
-  def test_call_poly_error(self):
-    a = np.arange(4, dtype=np.float32)
-    exp_f1 = jax_export.export(jnp.sin)(
-        jax_export.poly_spec(a.shape, a.dtype, "b, ...")
+  # An inner function is exported with polymorphic shapes inner_poly_spec, and
+  # is called from an outer function, which is exported with outer_poly_spec.
+  @parameterized.named_parameters(
+      dict(testcase_name=f"inner={d['inner_poly_spec']}_outer={d['outer_poly_spec']}",  # type: ignore
+           **d)  # type: ignore
+      for d in (
+          dict(inner_poly_spec="3,a,a+b", outer_poly_spec="3,4,12"),
+          dict(inner_poly_spec="3,a,a+b", outer_poly_spec="3,4,c"),
+          dict(inner_poly_spec="3,a,a+b", outer_poly_spec="3,c,c",
+               expect_error=(
+                   r"Dimension variable 'b' must have integer value >= 1. "
+                   r"Found 0 when solving a \+ b == args\[0\].shape\[2\]")),
+          dict(inner_poly_spec="3,a,a+b", outer_poly_spec="c,4,12",
+               expect_error=r"Shape mismatch for args\[0\].shape\[0\] \(expected constant\)"),
+          dict(inner_poly_spec="3,a,a+b", outer_poly_spec="3,c+4,12"),  # TODO: This should be an error, c = 0
+          dict(inner_poly_spec="3,4,3*a", outer_poly_spec="3,4,12"),
+          dict(inner_poly_spec="3,4,5*a", outer_poly_spec="3,4,12",
+               expect_error=(
+                   r"Dimension variable 'a' must have integer value >= 1. "
+                   r"Non-zero remainder 2 for factor 5 when solving 5\*a == args\[0\].shape\[2\]")),
+          # dict(inner_poly_spec="3,4,5*a", outer_poly_spec="3,4,c"),  # TODO: there should be an error 5*a != c == 12
+          # dict(inner_poly_spec="3,a,a", outer_poly_spec="3,a,a"),  # TODO: this should be a dynamic error
+          dict(inner_poly_spec="3,a", inner_x_shape=(3, 4), outer_poly_spec="3,a,a",
+               expect_error=r"Rank mismatch for args\[0\]"),
+          dict(inner_poly_spec="3,a,a+b", inner_x_dtype=np.int32, outer_poly_spec="3,c,d",
+               expect_error=r"Dtype mismatch for args\[0\]"),
+      ))
+  def test_poly(self, inner_poly_spec="3,a,a+b", inner_x_shape=(3, 4, 6),
+                inner_x_dtype=np.float32,
+                outer_poly_spec="3,c+4,12",  outer_x_shape=(3, 4, 12),
+                expect_error=None):
+    # Polymorphic export called with static or polymorphic shapes
+    def inner(x):  # x: inner_poly_spec
+      return jnp.reshape(x, (-1, x.shape[1]))
+
+    inner_x = np.arange(np.prod(inner_x_shape),
+                        dtype=inner_x_dtype).reshape(inner_x_shape)  # inner_x : f32[3,4,6]
+    inner_exp = jax_export.export(inner)(
+        jax_export.poly_spec(inner_x.shape, inner_x.dtype, inner_poly_spec))
+
+    self.assertEqual(inner_exp.module_uses_dim_vars,
+                     (inner_poly_spec != "3,4,12"))
+    outer_x = np.arange(np.prod(outer_x_shape),
+                        dtype=np.float32).reshape(outer_x_shape)  # outer_x : f32[3,4,12]
+    def outer(x):  # x: outer_poly_spec
+      # Use an addition to test that the shapes are refined properly for the
+      # result of the call_exported.
+      return jax_export.call_exported(inner_exp)(x) + inner(x)
+
+    with contextlib.ExitStack() as stack:
+      if expect_error is not None:
+        stack.push(self.assertRaisesRegex(ValueError, expect_error))
+
+      # Call it after exporting again, with polymorphic shapes
+      outer_exp = jax_export.export(outer)(
+          jax_export.poly_spec(outer_x.shape, outer_x.dtype, outer_poly_spec))
+      self.assertEqual(outer_exp.module_uses_dim_vars,
+                       (inner_poly_spec != "3,4,12" or outer_poly_spec != "3,4,12"))
+      if not outer_exp.module_uses_dim_vars:
+        res = jax_export.call_exported(outer_exp)(outer_x)
+        self.assertAllClose(2. * inner(outer_x), res)
+      else:
+        # TODO: for now, we use XlaCallModule to run modules with polymorphic shapes
+        # until we create the python bindings to invoke shape refinement.
+        if jax2tf is not None:
+          res = jax2tf._run_exported_as_tf([outer_x], outer_exp)[0].numpy()
+          self.assertAllClose(2. * inner(outer_x), res)
+
+  def test_call_poly(self):
+    a_shape = (3, 4)
+    a = np.arange(math.prod(a_shape), dtype=np.float32).reshape(a_shape)
+
+    def f_inner(x):  # x: f32[w, h]
+      return jnp.reshape(x, (-1,))
+
+    exp_inner = jax_export.export(f_inner)(
+        jax_export.poly_spec(a.shape, a.dtype, "w, h")
     )
-    with self.assertRaisesRegex(NotImplementedError,
-        "call_exported for exported with polymorphic shapes"):
-      jax_export.call_exported(exp_f1)(a)
+
+    # There are dynamic shapes in the exported module
+    self.assertIn("?x", exp_inner.mlir_module)
+    self.assertIn("stablehlo.dynamic_reshape", exp_inner.mlir_module)
+
+    # Add a wrapper "main" func with static shapes
+    # TODO(necula): We will add this functionality to jax_export.
+    from jax._src.interpreters import mlir
+    from jax._src.lib.mlir import ir
+    from jax._src.lib.mlir.dialects import hlo
+    from jax._src.lib.mlir.dialects import func as func_dialect
+    from jax.lib import xla_client as xc
+    from jax._src.lib import xla_extension
+
+    context = mlir.make_ir_context()
+    with context, ir.Location.unknown(context):
+      wrapped_module = ir.Module.parse(exp_inner.mlir_module)
+      symbol_table = ir.SymbolTable(wrapped_module.operation)
+      orig_main = symbol_table["main"]
+      orig_main.attributes["sym_visibility"] = ir.StringAttr.get("private")
+      symbol_table.set_symbol_name(orig_main, "_wrapped_jax_export_main")
+      orig_main_name = ir.StringAttr(symbol_table.insert(orig_main)).value
+      # Use static shapes
+      new_main_input_types = [
+          mlir.aval_to_ir_type(core.ShapedArray((3, 4), np.float32))
+      ]
+      orig_output_types = orig_main.type.results
+      new_main_ftype = ir.FunctionType.get(
+          new_main_input_types, orig_output_types
+      )
+      new_main_op = func_dialect.FuncOp(
+          "main",
+          new_main_ftype,
+          ip=ir.InsertionPoint.at_block_begin(wrapped_module.body),
+      )
+      new_main_op.attributes["sym_visibility"] = ir.StringAttr.get("public")
+      symbol_table.insert(new_main_op)
+      entry_block = new_main_op.add_entry_block()
+      with ir.InsertionPoint(entry_block):
+        orig_main_args: List[ir.Value] = []
+        for new_arg, orig_arg_type in zip(
+            new_main_op.arguments, orig_main.type.inputs
+        ):
+          orig_main_args.append(hlo.ConvertOp(orig_arg_type, new_arg).result)
+        call = func_dialect.CallOp(
+            orig_output_types,
+            ir.FlatSymbolRefAttr.get(orig_main_name),
+            orig_main_args,
+        )
+        func_dialect.ReturnOp(call.results)
+    symbol_table.set_symbol_name(new_main_op, "main")
+
+    # TODO(necula): need conditionals until jaxlib 0.4.12 is the minimum version
+    if xc.mlir_api_version >= 50:
+      refined_module_str = xla_extension.mlir.refine_polymorphic_shapes(
+          mlir.module_to_bytecode(wrapped_module)
+      )
+      context = mlir.make_ir_context()
+      with context:
+        refined_module = ir.Module.parse(refined_module_str)
+
+      logging.info("Postprocessed module %s", str(refined_module))
+      self.assertNotIn("?x", str(refined_module))
+      self.assertNotIn("stablehlo.dynamic_reshape", str(refined_module))
+      self.assertIn("stablehlo.reshape", str(refined_module))
 
 
 if __name__ == "__main__":

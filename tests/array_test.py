@@ -30,7 +30,6 @@ from jax._src import op_shardings
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension_version
 from jax._src.util import safe_zip
 from jax._src.sharding_impls import _from_op_sharding_to_pos_sharding
 from jax.experimental.pjit import pjit
@@ -691,21 +690,30 @@ class JaxArrayTest(jtu.JaxTestCase):
     self.assertArraysEqual(out, x)
 
   @jtu.sample_product(
-    dtype=[dt for dt in jtu.dtypes.all if dt != jax.dtypes.bfloat16],
+    dtype=jtu.dtypes.all,
     shape=[(), (10), (2, 3)],
   )
-  @unittest.skipIf(xla_extension_version < 157, "Test requires jaxlib >= 0.4.11")
   def test_buffer_protocol(self, dtype, shape):
     if jtu.device_under_test() != "cpu":
       raise unittest.SkipTest("Buffer protocol only works on CPU")
     rng = jtu.rand_default(self.rng())
     x = rng(shape, dtype)
     y = jax.device_put(x)
+    if dtype == jax.dtypes.bfloat16:
+      with self.assertRaises(
+          BufferError,
+          msg=(
+              'Buffers of type BF16 are not supported by the Python buffer'
+              ' protocol.'
+          ),
+      ):
+        memoryview(y)
+      return
+
     x_bytes = memoryview(x).tobytes()
     y_bytes = memoryview(y).tobytes()
     self.assertEqual(x_bytes, y_bytes)
 
-  @unittest.skipIf(xla_extension_version < 157, "Test requires jaxlib >= 0.4.11")
   def test_buffer_protocol_deletion(self):
     if jtu.device_under_test() != "cpu":
       raise unittest.SkipTest("Buffer protocol only works on CPU")
@@ -731,8 +739,6 @@ class JaxArrayTest(jtu.JaxTestCase):
     self.assertArraysEqual(np.arange(8.), x)
 
   def test_array_fully_replicated_shard(self):
-    if xla_extension_version < 148:
-      self.skipTest('Requires xla_extension_version >= 148')
 
     global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
     inp_shape = (8, 2)
@@ -1151,7 +1157,6 @@ class RngShardingTest(jtu.JaxTestCase):
     y = f(x)
     y_ref1 = f(jax.device_put(x, jax.devices()[0]))
     self.assertArraysEqual(y, y_ref1)
-
 
 
 if __name__ == '__main__':
