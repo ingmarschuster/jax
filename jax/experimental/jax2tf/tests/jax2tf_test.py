@@ -1640,6 +1640,25 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     res = jax2tf.convert(f_jax, native_serialization=True)(*many_args)
     self.assertAllClose(f_jax(*many_args), res)
 
+  def test_nested_convert(self):
+    # Test call sequence: convert -> call_tf -> convert.
+
+    @jax.jit
+    def f_jax(x):
+      return x + 1
+
+    inputs = np.ones((10), dtype=np.float32)
+
+    res = f_jax(inputs)
+
+    f_tf = jax2tf.convert(f_jax, native_serialization=True)
+    self.assertAllClose(res, f_tf(inputs))
+
+    f_jax_nested = jax2tf.call_tf(f_tf)
+    self.assertAllClose(res, f_jax_nested(inputs))
+
+    f_tf_nested = jax2tf.convert(f_jax_nested, native_serialization=True)
+    self.assertAllClose(res, f_tf_nested(inputs))
 
 def get_serialized_computation(
     f_jax: Callable,
@@ -1780,7 +1799,10 @@ class Jax2tfWithCustomPRNGTest(tf_test_util.JaxToTfTestCase):
     self.assertEqual(tf_result, jax_result)
 
   def test_key_closure(self):
-    func = lambda: jax.random.uniform(global_key, ())
+    def func():
+      # Include nontrivial shape operations to catch tracing bugs.
+      key = global_key.reshape(1).squeeze()
+      return jax.random.uniform(key)
     global_key = jax.random.PRNGKey(0)
     tf_result = jax2tf.convert(func)()
     jax_result = func()

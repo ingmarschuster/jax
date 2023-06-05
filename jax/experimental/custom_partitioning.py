@@ -27,7 +27,6 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src import custom_api_util
 from jax._src.lib import xla_client as xc
-from jax._src.lib import xla_extension_version
 from jax._src.api_util import flatten_fun_nokwargs
 from jax._src.api_util import argnums_partial
 
@@ -122,8 +121,10 @@ def _custom_partitioning_propagate_user_sharding(user_sharding, shape,
 
 
 def _to_hlo_sharding(sharding, num_dimensions):
-  if not isinstance(sharding, jax.sharding.Sharding):
-    raise ValueError("Custom Partitioning rules must return shardings.")
+  if not isinstance(sharding, jax.sharding.XLACompatibleSharding):
+    raise ValueError(
+        "Custom Partitioning rules must return XLACompatibleShardings."
+    )
   return xc.HloSharding.from_proto(sharding._to_xla_op_sharding(num_dimensions))
 
 
@@ -496,8 +497,7 @@ def _custom_partitioning_lowering_rule(ctx: mlir.LoweringRuleContext, *values,
 
   result_types = [mlir.aval_to_ir_type(s) for s in call.out_avals]
   out = hlo.CustomCallOp(
-      (result_types if xla_extension_version >= 150 or len(result_types) == 1
-       else [ir.TupleType.get(result_types)]),
+      result_types,
       list(values),
       call_target_name=ir.StringAttr.get(_CUSTOM_PARTITIONING_CALL_NAME),
       has_side_effect=ir.BoolAttr.get(False),
@@ -506,13 +506,7 @@ def _custom_partitioning_lowering_rule(ctx: mlir.LoweringRuleContext, *values,
       backend_config=ir.StringAttr.get(key),
       operand_layouts=None,
       result_layouts=None)
-  if xla_extension_version >= 150 or len(result_types) == 1:
-    return out.results
-  else:
-    return [
-        hlo.GetTupleElementOp(out, mlir.i32_attr(i)).result
-        for i in range(len(result_types))
-    ]
+  return out.results
 
 mlir.register_lowering(custom_partitioning_p,
                        _custom_partitioning_lowering_rule)

@@ -19,13 +19,13 @@ import sys
 
 from setuptools import setup, find_packages
 
-_current_jaxlib_version = '0.4.10'
+_current_jaxlib_version = '0.4.11'
 # The following should be updated with each new jaxlib release.
-_latest_jaxlib_version_on_pypi = '0.4.10'
+_latest_jaxlib_version_on_pypi = '0.4.11'
 _available_cuda11_cudnn_versions = ['82', '86']
 _default_cuda11_cudnn_version = '86'
 _default_cuda12_cudnn_version = '88'
-_libtpu_version = '0.1.dev20230511'
+_libtpu_version = '0.1.dev20230531'
 
 _dct = {}
 with open('jax/version.py', encoding='utf-8') as f:
@@ -67,6 +67,10 @@ setup(
         'numpy>=1.21',
         'opt_einsum',
         'scipy>=1.7',
+        # Required by xla_bridge.discover_pjrt_plugins for forwards compat with
+        # Python versions < 3.10. Can be dropped when 3.10 is the minimum
+        # required Python version.
+        'importlib_metadata>=4.6;python_version<"3.10"',
     ],
     extras_require={
         # Minimum jaxlib version; used in testing.
@@ -82,9 +86,7 @@ setup(
         # Cloud TPU VM jaxlib can be installed via:
         # $ pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
         'tpu': [f'jaxlib=={_current_jaxlib_version}',
-                f'libtpu-nightly=={_libtpu_version}',
-                # Required by cloud_tpu_init.py
-                'requests'],
+                f'libtpu-nightly=={_libtpu_version}'],
 
         # $ pip install jax[australis]
         'australis': ['protobuf>=3.13,<4'],
@@ -100,7 +102,7 @@ setup(
           "nvidia-cuda-cupti-cu11>=11.8",
           "nvidia-cuda-nvcc-cu11>=11.8",
           "nvidia-cuda-runtime-cu11>=11.8",
-          "nvidia-cudnn-cu11>=8.6",
+          "nvidia-cudnn-cu11>=8.8",
           "nvidia-cufft-cu11>=10.9",
           "nvidia-cusolver-cu11>=11.4",
           "nvidia-cusparse-cu11>=11.7",
@@ -112,7 +114,7 @@ setup(
           "nvidia-cuda-cupti-cu12",
           "nvidia-cuda-nvcc-cu12",
           "nvidia-cuda-runtime-cu12",
-          "nvidia-cudnn-cu12",
+          "nvidia-cudnn-cu12>=8.9",
           "nvidia-cufft-cu12",
           "nvidia-cusolver-cu12",
           "nvidia-cusparse-cu12",

@@ -15,6 +15,7 @@
 import dataclasses
 import inspect
 import logging
+import weakref
 import numpy as np
 from typing import (Callable, Sequence, Tuple, Union, cast, List, Optional,
                     Iterable, NamedTuple, Any)
@@ -119,7 +120,10 @@ def _get_arg_names(fun, in_tree, args_flat):
     ak, *rem_keys = arg_key
     if sig is not None:
       loc = ''.join(str(k) for k in rem_keys)
-      arg_name = f'{list(sig.arguments.keys())[ak.idx]}{loc}'
+      try:
+        arg_name = f'{list(sig.arguments.keys())[ak.idx]}{loc}'
+      except IndexError:
+        arg_name = ''  # E.g. variadic positional argument.
     else:
       arg_name = ''
     arg_names.append(arg_name)
@@ -183,6 +187,32 @@ def _python_pjit(fun: Callable, infer_params_fn):
   wrapped.clear_cache = _python_pjit_evict_fn
   return wrapped
 
+
+def _get_fastpath_data(executable, out_tree, args_flat, out_flat):
+  use_fastpath = (
+      executable is not None and
+      isinstance(executable, pxla.MeshExecutable) and
+      isinstance(executable.unsafe_call, pxla.ExecuteReplicated) and
+      # No effects in computation
+      not executable.unsafe_call.ordered_effects and
+      not executable.unsafe_call.has_unordered_effects and
+      not executable.unsafe_call.has_host_callbacks and
+      all(isinstance(x, xc.ArrayImpl) for x in out_flat)
+  )
+
+  if use_fastpath:
+    out_avals = [o.aval for o in out_flat]
+    out_committed = [o._committed for o in out_flat]
+    kept_var_bitvec = [i in executable._kept_var_idx
+                       for i in range(len(args_flat))]
+    fastpath_data = pxla.MeshExecutableFastpathData(
+        executable.xla_executable, out_tree, executable._in_shardings,
+        executable._out_shardings, out_avals, out_committed, kept_var_bitvec)
+  else:
+    fastpath_data = None
+  return fastpath_data
+
+
 class _MostRecentPjitCallExecutable(threading.local):
   def __init__(self):
     self.value = None
@@ -201,7 +231,17 @@ def _cpp_pjit_evict_fn(self):
   _create_pjit_jaxpr.evict_function(self._fun)  # type: ignore
 
 
-_cpp_pjit_cache = xc._xla.PjitFunctionCache()
+# The entries are doubled here from the default 4096 because _pjit_call_impl
+# also has a cpp dispatch path and that would double the number of entries in
+# the global shared cache.
+_cpp_pjit_cache = xc._xla.PjitFunctionCache(capacity=8192)
+
+
+def _get_cpp_global_cache(pjit_has_explicit_sharding):
+  if pjit_has_explicit_sharding:
+    return xc._xla.PjitFunctionCache()
+  else:
+    return _cpp_pjit_cache
 
 
 def _cpp_pjit(fun: Callable, infer_params_fn, static_argnums, static_argnames,
@@ -211,41 +251,14 @@ def _cpp_pjit(fun: Callable, infer_params_fn, static_argnums, static_argnames,
   def cache_miss(*args, **kwargs):
     outs, out_flat, out_tree, args_flat = _python_pjit_helper(
         fun, infer_params_fn, *args, **kwargs)
-
     executable = _read_most_recent_pjit_call_executable()
-
-    use_fastpath = (
-        executable is not None and
-        isinstance(executable, pxla.MeshExecutable) and
-        isinstance(executable.unsafe_call, pxla.ExecuteReplicated) and
-        # No effects in computation
-        not executable.unsafe_call.ordered_effects and
-        not executable.unsafe_call.has_unordered_effects and
-        not executable.unsafe_call.has_host_callbacks and
-        all(isinstance(x, xc.ArrayImpl) for x in out_flat)
-    )
-
-    if use_fastpath:
-      out_avals = [o.aval for o in out_flat]
-      out_committed = [o._committed for o in out_flat]
-      kept_var_bitvec = [i in executable._kept_var_idx
-                         for i in range(len(args_flat))]
-      fastpath_data = pxla.MeshExecutableFastpathData(
-          executable.xla_executable, out_tree, executable._in_shardings,
-          executable._out_shardings, out_avals, out_committed, kept_var_bitvec)
-    else:
-      fastpath_data = None
-
+    fastpath_data = _get_fastpath_data(executable, out_tree, args_flat, out_flat)
     return outs, fastpath_data
 
-  if pjit_has_explicit_sharding:
-    global_cache = xc._xla.PjitFunctionCache()
-  else:
-    global_cache = _cpp_pjit_cache
   cpp_pjit_f = xc._xla.pjit(  # type: ignore
       getattr(fun, "__name__", "<unnamed function>"),  # type: ignore
       fun, cache_miss, static_argnums, static_argnames,  # type: ignore
-      donate_argnums, global_cache)  # type: ignore
+      donate_argnums, _get_cpp_global_cache(pjit_has_explicit_sharding))  # type: ignore
 
   cpp_pjitted_f = wraps(fun)(cpp_pjit_f)
   cpp_pjitted_f._fun = fun
@@ -578,6 +591,7 @@ def pjit(
 ) -> stages.Wrapped:
   """Makes ``fun`` compiled and automatically partitioned across multiple devices.
 
+  NOTE: This function is now equivalent to jax.jit please use that instead.
   The returned function has semantics equivalent to those of ``fun``, but is
   compiled to an XLA computation that runs across multiple devices
   (e.g. multiple GPUs or multiple TPU cores). This can be useful if the jitted
@@ -1087,9 +1101,9 @@ def _resolve_in_shardings(
   return tuple(resolved_in_shardings)
 
 
-def _pjit_call_impl(*args, jaxpr,
-                    in_shardings, out_shardings, resource_env,
-                    donated_invars, name, keep_unused, inline):
+def _pjit_call_impl_python(
+    *args, jaxpr, in_shardings, out_shardings, resource_env, donated_invars,
+    name, keep_unused, inline):
   global _most_recent_pjit_call_executable
 
   in_shardings = _resolve_in_shardings(
@@ -1119,7 +1133,7 @@ def _pjit_call_impl(*args, jaxpr,
                           ("abstract args", map(xla.abstractify, args)),
                           ("fingerprint", fingerprint))
   try:
-    return compiled.unsafe_call(*args)
+    return compiled.unsafe_call(*args), compiled
   except FloatingPointError:
     assert config.jax_debug_nans or config.jax_debug_infs  # compiled_fun can only raise in this case
 
@@ -1144,6 +1158,43 @@ def _pjit_call_impl(*args, jaxpr,
            "If you see this error, consider opening a bug report at "
            "https://github.com/google/jax.")
     raise FloatingPointError(msg)
+
+
+@weakref_lru_cache
+def _get_jaxpr_as_fun(jaxpr, in_shardings, out_shardings, resource_env,
+                      donated_invars, name, keep_unused, inline):
+  # The input jaxpr to `_get_jaxpr_as_fun` is under a weakref_lru_cache so
+  # returning `core.jaxpr_as_fun(jaxpr)` directly creates a strong reference to
+  # the jaxpr defeating the purpose of weakref_lru_cache. So return a function
+  # that closes over a weakrefed jaxpr and gets called inside that function.
+  # This way there won't be a strong reference to the jaxpr from the output
+  # function.
+  jaxpr = weakref.ref(jaxpr)
+  return lambda *args: core.jaxpr_as_fun(jaxpr())(*args)  # pylint: disable=unnecessary-lambda
+
+
+def _pjit_call_impl(*args, jaxpr,
+                    in_shardings, out_shardings, resource_env,
+                    donated_invars, name, keep_unused, inline):
+  def call_impl_cache_miss(*args_, **kwargs_):
+    out_flat, compiled = _pjit_call_impl_python(
+        *args, jaxpr=jaxpr, in_shardings=in_shardings,
+        out_shardings=out_shardings, resource_env=resource_env,
+        donated_invars=donated_invars, name=name, keep_unused=keep_unused,
+        inline=inline)
+    fastpath_data = _get_fastpath_data(
+        compiled, tree_structure(out_flat), args, out_flat)
+    return out_flat, fastpath_data
+
+  f = _get_jaxpr_as_fun(
+      jaxpr, tuple(getattr(i, '_original_sharding', i) for i in in_shardings),
+      tuple(getattr(o, '_original_sharding', o) for o in out_shardings),
+      resource_env, donated_invars, name, keep_unused, inline)
+  donated_argnums = [i for i, d in enumerate(donated_invars) if d]
+  has_explicit_sharding = _pjit_explicit_sharding(
+      in_shardings, out_shardings, None, None)
+  return xc._xla.pjit(name, f, call_impl_cache_miss, [], [], donated_argnums,
+                      _get_cpp_global_cache(has_explicit_sharding))(*args)
 
 pjit_p.def_impl(_pjit_call_impl)
 
@@ -1743,32 +1794,7 @@ core.pp_eqn_rules[pjit_p] = _pjit_pp_rule
 
 # -------------------- with_sharding_constraint --------------------
 
-def _resolve_wsc_args(axis_resources, shardings):
-  if not is_unspecified(axis_resources) and not is_unspecified(shardings):
-    raise ValueError(
-        'Setting both axis_resources and shardings is not '
-        'allowed. axis_resources is deprecated. Please use shardings.')
-  if is_unspecified(axis_resources) and is_unspecified(shardings):
-    raise ValueError(
-        'Not specifying shardings to `with_sharding_constraint` is not allowed. '
-        'Please specify the shardings argument with a concrete sharding. Note '
-        'that axis_resources is deprecated, so use the shardings argument.')
-
-  if not is_unspecified(axis_resources):
-    warnings.warn(
-        'axis_resources is deprecated. Please use shardings argument instead.',
-        DeprecationWarning)
-    final_shardings = axis_resources
-  else:
-    final_shardings = shardings
-  return final_shardings
-
-
-# TODO(yashkatariya): Remove the axis_resources argument and make the signature
-# `with_sharding_constraint(x, shardings)` with no defaults after deprecation
-# period is finished. The deprecation period expires 3 months from Feb 13, 2023.
-def with_sharding_constraint(x, shardings=UNSPECIFIED,
-                             axis_resources=UNSPECIFIED):
+def with_sharding_constraint(x, shardings):
   """Mechanism to constrain the sharding of an Array inside a jitted computation
 
   This is a strict constraint for the GSPMD partitioner and not a hint. For examples
@@ -1778,17 +1804,15 @@ def with_sharding_constraint(x, shardings=UNSPECIFIED,
     x: PyTree of jax.Arrays which will have their shardings constrainted
     shardings: PyTree of sharding specifications. Valid values are the same as for
       the ``in_shardings`` argument of :func:`jax.experimental.pjit`.
-    axis_resources: (deprecated) use shardings instead.
   Returns:
     x_with_shardings: PyTree of jax.Arrays with specified sharding constraints.
 
   .. _Distributed arrays and automatic parallelization: https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
   """
-  final_shardings = _resolve_wsc_args(axis_resources, shardings)
   x_flat, tree = tree_flatten(x)
   user_shardings, _, _ = prepare_axis_resources(
-      final_shardings, "shardings", allow_unconstrained_dims=True)
-  del final_shardings
+      shardings, "shardings", allow_unconstrained_dims=True)
+  del shardings
 
   user_shardings_flat = tuple(
       flatten_axes("with_sharding_constraint shardings", tree, user_shardings))

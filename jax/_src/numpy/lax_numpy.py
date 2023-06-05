@@ -538,6 +538,28 @@ def transpose(a: ArrayLike, axes: Optional[Sequence[int]] = None) -> Array:
   return lax.transpose(a, axes_)
 
 
+@util._wraps(getattr(np, 'matrix_transpose', None))
+def matrix_transpose(x: ArrayLike, /) -> Array:
+  """Transposes the last two dimensions of x.
+
+  Parameters
+  ----------
+  x : array_like
+      Input array. Must have ``x.ndim >= 2``.
+
+  Returns
+  -------
+  xT : Array
+      Transposed array.
+  """
+  util.check_arraylike("matrix_transpose", x)
+  ndim = np.ndim(x)
+  if ndim < 2:
+    raise ValueError(f"x must be at least two-dimensional for matrix_transpose; got {ndim=}")
+  axes = (*range(ndim - 2), ndim - 1, ndim - 2)
+  return lax.transpose(x, axes)
+
+
 @util._wraps(np.rot90, lax_description=_ARRAY_VIEW_DOC)
 @partial(jit, static_argnames=('k', 'axes'))
 def rot90(m: ArrayLike, k: int = 1, axes: Tuple[int, int] = (0, 1)) -> Array:
@@ -2269,7 +2291,7 @@ def arange(start: DimSize, stop: Optional[DimSize] = None,
       step = 1
     elif stop is not None and step is None:
       step = 1
-    return _arange_dynamic(start, stop, step, dtype or int_)
+    return _arange_dynamic(start, stop, step, dtype or dtypes.canonicalize_dtype(np.int64))
   if dtype is None:
     dtype = result_type(start, *(x for x in [stop, step] if x is not None))
   dtype = _jnp_dtype(dtype)
@@ -3690,35 +3712,50 @@ def argpartition(a: ArrayLike, kth: int, axis: int = -1) -> Array:
 
 
 @partial(jit, static_argnums=(2,))
-def _roll(a, shift, axis):
-  a_shape = shape(a)
-  if axis is None:
-    return lax.reshape(_roll(ravel(a), shift, axis=0), a_shape)
-  shift = asarray(shift)
-  a_ndim = len(a_shape)
-  axis = np.asarray(axis)
-  b_shape = lax.broadcast_shapes(shift.shape, axis.shape, (1,))
+def _roll_dynamic(a: Array, shift: Array, axis: Sequence[int]) -> Array:
+  b_shape = lax.broadcast_shapes(shift.shape, np.shape(axis))
   if len(b_shape) != 1:
     msg = "'shift' and 'axis' arguments to roll must be scalars or 1D arrays"
     raise ValueError(msg)
 
   for x, i in zip(broadcast_to(shift, b_shape),
                   np.broadcast_to(axis, b_shape)):
-    i = _canonicalize_axis(i, a_ndim)
-    a_shape_i = array(a_shape[i], dtype=np.int32)
+    a_shape_i = array(a.shape[i], dtype=np.int32)
     x = ufuncs.remainder(lax.convert_element_type(x, np.int32),
-                  lax.max(a_shape_i, np.int32(1)))
-    a = lax.concatenate((a, a), i)
-    a = lax.dynamic_slice_in_dim(a, a_shape_i - x, a_shape[i], axis=i)
+                         lax.max(a_shape_i, np.int32(1)))
+    a_concat = lax.concatenate((a, a), i)
+    a = lax.dynamic_slice_in_dim(a_concat, a_shape_i - x, a.shape[i], axis=i)
   return a
 
+@partial(jit, static_argnums=(1, 2))
+def _roll_static(a: Array, shift: Sequence[int], axis: Sequence[int]) -> Array:
+  for ax, s in zip(*np.broadcast_arrays(axis, shift)):
+    if a.shape[ax] == 0:
+      continue
+    i = (-s) % a.shape[ax]
+    a = lax.concatenate([lax.slice_in_dim(a, i, a.shape[ax], axis=ax),
+                         lax.slice_in_dim(a, 0, i, axis=ax)],
+                        dimension=ax)
+  return a
 
 @util._wraps(np.roll)
-def roll(a, shift, axis: Optional[Union[int, Sequence[int]]] = None):
-  util.check_arraylike("roll", a,)
-  if isinstance(axis, list):
-    axis = tuple(axis)
-  return _roll(a, shift, axis)
+def roll(a: ArrayLike, shift: Union[ArrayLike, Sequence[int]],
+         axis: Optional[Union[int, Sequence[int]]] = None) -> Array:
+  util.check_arraylike("roll", a)
+  arr = asarray(a)
+  if axis is None:
+    return roll(arr.ravel(), shift, 0).reshape(arr.shape)
+  axis = _ensure_index_tuple(axis)
+  axis = tuple(_canonicalize_axis(ax, arr.ndim) for ax in axis)
+  if not core.is_constant_shape(arr.shape):
+    # TODO(necula): support static roll for polymorphic shapes.
+    return _roll_dynamic(arr, asarray(shift), axis)
+  try:
+    shift = _ensure_index_tuple(shift)
+  except TypeError:
+    return _roll_dynamic(arr, asarray(shift), axis)
+  else:
+    return _roll_static(arr, shift, axis)
 
 
 @util._wraps(np.rollaxis, lax_description=_ARRAY_VIEW_DOC)

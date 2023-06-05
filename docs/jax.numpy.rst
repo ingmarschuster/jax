@@ -50,7 +50,6 @@ namespace; they are listed below.
     add
     all
     allclose
-    alltrue
     amax
     amin
     angle
@@ -125,7 +124,6 @@ namespace; they are listed below.
     cross
     csingle
     cumprod
-    cumproduct
     cumsum
     deg2rad
     degrees
@@ -259,6 +257,7 @@ namespace; they are listed below.
     logspace
     mask_indices
     matmul
+    matrix_transpose
     max
     maximum
     mean
@@ -317,7 +316,6 @@ namespace; they are listed below.
     power
     printoptions
     prod
-    product
     promote_types
     ptp
     put
@@ -360,7 +358,6 @@ namespace; they are listed below.
     single
     sinh
     size
-    sometrue
     sort
     sort_complex
     split

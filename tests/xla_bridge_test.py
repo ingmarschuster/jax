@@ -96,15 +96,9 @@ class XlaBridgeTest(jtu.JaxTestCase):
       xb.register_pjrt_plugin_factories_from_env()
     client_factory, priotiy = xb._backend_factories["name1"]
     with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
-      with mock.patch.object(
-          xc, "load_pjrt_plugin_dynamically", autospec=True
-      ) as mock_load_plugin:
-        if xc._version >= 152:
-          with mock.patch.object(
-              xc, "pjrt_plugin_loaded", autospec=True
-          ) as mock_plugin_loaded:
-            client_factory()
-        else:
+      with mock.patch.object(xc, "load_pjrt_plugin_dynamically", autospec=True):
+        with mock.patch.object(
+            xc, "pjrt_plugin_loaded", autospec=True) as mock_plugin_loaded:
           client_factory()
 
     self.assertRegex(
@@ -115,18 +109,10 @@ class XlaBridgeTest(jtu.JaxTestCase):
     self.assertIn("name1", xb._backend_factories)
     self.assertIn("name2", xb._backend_factories)
     self.assertEqual(priotiy, 400)
-    if xc._version >= 152:
-      mock_plugin_loaded.assert_called_once_with("name1")
-    else:
-      mock_load_plugin.assert_called_once_with("name1", "path1")
-    if xc._version >= 134:
-      mock_make.assert_called_once_with("name1", None)
-    else:
-      mock_make.assert_called_once_with("name1")
+    mock_plugin_loaded.assert_called_once_with("name1")
+    mock_make.assert_called_once_with("name1", None)
 
   def test_register_plugin_with_config(self):
-    if xc._version < 134:
-      return
     test_json_file_path = os.path.join(
         os.path.dirname(__file__), "testdata/example_pjrt_plugin_config.json"
     )
@@ -134,25 +120,14 @@ class XlaBridgeTest(jtu.JaxTestCase):
     xb.register_pjrt_plugin_factories_from_env()
     client_factory, priority = xb._backend_factories["name1"]
     with mock.patch.object(xc, "make_c_api_client", autospec=True) as mock_make:
-      with mock.patch.object(
-          xc, "load_pjrt_plugin_dynamically", autospec=True
-      ) as mock_load_plugin:
-        if xc._version >= 152:
-          with mock.patch.object(
-              xc, "pjrt_plugin_loaded", autospec=True
-          ) as mock_plugin_loaded:
-            client_factory()
-        else:
+      with mock.patch.object(xc, "load_pjrt_plugin_dynamically", autospec=True):
+        with mock.patch.object(
+            xc, "pjrt_plugin_loaded", autospec=True) as mock_plugin_loaded:
           client_factory()
 
     self.assertIn("name1", xb._backend_factories)
     self.assertEqual(priority, 400)
-    if xc._version >= 152:
-      mock_plugin_loaded.assert_called_once_with("name1")
-    else:
-      mock_load_plugin.assert_called_once_with(
-          "name1", "/path/pjrt_plugin_name1.so"
-      )
+    mock_plugin_loaded.assert_called_once_with("name1")
     mock_make.assert_called_once_with(
         "name1",
         {

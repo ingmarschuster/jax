@@ -56,7 +56,6 @@ from jax.interpreters import mlir
 from jax._src import xla_bridge
 from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_extension
-from jax._src.lib import xla_extension_version
 from jax._src.util import curry, unzip2, safe_zip
 
 from jax import config
@@ -1164,9 +1163,6 @@ class CustomPartitionerTest(jtu.JaxTestCase):
   def test_custom_partitioner(self):
     self.skip_if_custom_partitioning_not_supported()
 
-    if xla_extension_version < 154:
-      self.skipTest('Requires xla_extension_version >= 154')
-
     def partition(precision, arg_shapes, result_shape):
       arg_shardings = jax.tree_map(lambda s: s.sharding, arg_shapes)
       result_sharding = result_shape[0].sharding
@@ -1285,9 +1281,6 @@ class CustomPartitionerTest(jtu.JaxTestCase):
   @jtu.with_mesh([('x', 4), ('y', 2)])
   def test_custom_partitioner_invalid_sharding(self):
     self.skip_if_custom_partitioning_not_supported()
-    if xla_extension_version < 149:
-      self.skipTest('Requires xla_extension_version >= 149')
-
     def partition(arg_shapes, result_shape):
       def lower_fn(x):
         return x
@@ -2041,6 +2034,18 @@ class ArrayPjitTest(jtu.JaxTestCase):
         r"x of.*\<lambda\> with shape int.*\[3\] and device ids \[0\].*and "
         r"argument y of.*\<lambda\> with shape int.*\[3\] and device ids \[1\].*"):
       pjit(lambda x, y: (x, y))(a, b)
+
+  def test_pjit_committed_array_different_devices_variadic_args(self):
+    if jax.device_count() < 2:
+      self.skipTest('Test requires >= 2 devices')
+    a = jax.device_put(np.array([1, 2, 3]), jax.devices()[0])
+    b = jax.device_put(np.array([4, 5, 6]), jax.devices()[1])
+    with self.assertRaisesRegex(
+        ValueError,
+        "Received incompatible devices for pjitted computation. Got argument "
+        r"x of.*\<lambda\> with shape int.*\[3\] and device ids \[0\].*and "
+        r"argument  of.*\<lambda\> with shape int.*\[3\] and device ids \[1\].*"):
+      pjit(lambda *x: x)(a, b)
 
   def test_pjit_pytree_inp_device_assignment_mismatch(self):
     mesh = jtu.create_global_mesh((2, 2), ('x', 'y'))
@@ -2953,19 +2958,6 @@ class ArrayPjitTest(jtu.JaxTestCase):
         "Setting both out_shardings and out_axis_resources is not allowed"):
       pjit(lambda x: x, out_shardings=P('x'), out_axis_resources=P('x'))
 
-  def test_set_none_wsc_axis_resources_and_shardings(self):
-    with self.assertRaisesRegex(
-        ValueError,
-        "Not specifying shardings to `with_sharding_constraint` is not allowed."):
-      pjit(jax.lax.with_sharding_constraint(jnp.arange(8)))
-
-  def test_set_both_wsc_axis_resources_and_shardings(self):
-    with self.assertRaisesRegex(
-        ValueError,
-        "Setting both axis_resources and shardings is not allowed"):
-      pjit(jax.lax.with_sharding_constraint(
-          jnp.arange(8), axis_resources=P('x'), shardings=P('x')))
-
   def test_with_sharding_constraint_spmd_axis_name(self):
     mesh = jtu.create_global_mesh((2, 2, 2), ('replica', 'data', 'mdl'))
     shape = (8, 4, 2, 2)
@@ -3246,23 +3238,18 @@ class ArrayPjitTest(jtu.JaxTestCase):
     ns = NamedSharding(mesh, P('x'))
     arr = jax.device_put(
         np.arange(16).reshape(8, 2), NamedSharding(mesh, P(None, 'x')))
-    vf = jax.vmap(pjit(lambda x: x * 2, in_shardings=ns))
-    out = vf(arr)
-    cache_info1 = pjit_lib._pjit_lower_cached.cache_info()
-    self.assertIsInstance(out.sharding, NamedSharding)
 
-    out2 = vf(out)
-    cache_info2 = pjit_lib._pjit_lower_cached.cache_info()
-    self.assertIsInstance(out2.sharding, NamedSharding)
+    with jtu.count_jit_and_pmap_compiles() as count:
+      vf = jax.vmap(pjit(lambda x: x * 2, in_shardings=ns))
+      out = vf(arr)
+      self.assertIsInstance(out.sharding, NamedSharding)
 
-    out3 = vf(out2)
-    cache_info3 = pjit_lib._pjit_lower_cached.cache_info()
-    self.assertIsInstance(out3.sharding, NamedSharding)
+      out2 = vf(out)
+      self.assertIsInstance(out2.sharding, NamedSharding)
 
-    self.assertEqual(cache_info2.hits, cache_info1.hits + 1)
-    self.assertEqual(cache_info3.hits, cache_info2.hits + 1)
-    self.assertEqual(cache_info2.misses, cache_info1.misses)
-    self.assertEqual(cache_info3.misses, cache_info2.misses)
+      out3 = vf(out2)
+      self.assertIsInstance(out3.sharding, NamedSharding)
+    self.assertEqual(count[0], 1)
 
   def test_jit_mul_sum_sharding_preserved(self):
     mesh = jtu.create_global_mesh((2, 1), ('x', 'y'))
@@ -3445,6 +3432,20 @@ class ArrayPjitTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(
         ValueError, "Received incompatible devices for jitted computation"):
       with_sharding_constraint(inp, NamedSharding(mesh2, P('x')))
+
+  def test_jaxpr_as_fun_fast_path(self):
+    @jax.jit
+    def f(x):
+      return x * 2
+    inp = jax.device_put(jnp.arange(8), jax.devices()[0])
+    jaxpr = jax.make_jaxpr(f)(inp)
+
+    with jtu.count_pjit_cpp_cache_miss() as count:
+      out1 = core.jaxpr_as_fun(jaxpr)(inp)
+      out2 = core.jaxpr_as_fun(jaxpr)(inp)
+    self.assertEqual(count[0], 1)
+    self.assertArraysEqual(out1[0], inp * 2)
+    self.assertArraysEqual(out2[0], inp * 2)
 
 
 class TempSharding(Sharding):
@@ -3892,16 +3893,15 @@ class UtilTest(jtu.JaxTestCase):
     hs2 = xc.HloSharding.from_proto(op2)
     hs3 = xc.HloSharding.from_proto(op3)
 
-    if xla_extension_version >= 156:
-      self.assertEqual(hs1, xc.HloSharding.iota_tile((2, 2)))
-      self.assertEqual(hs2, xc.HloSharding.iota_tile((2, 2)))
-      self.assertEqual(hs3, xc.HloSharding.iota_tile((4, 2)))
-      self.assertEqual(hs1.num_devices(), 4)
-      self.assertEqual(hs1.num_dimensions(), 2)
-      self.assertEqual(hs1.tile_assignment_dimensions(), [2, 2])
-      self.assertEqual(hs1.tile_assignment_devices(), [0, 1, 2, 3])
-      self.assertTrue(hs1.is_tiled())
-      self.assertFalse(hs1.replicate_on_last_tile_dim())
+    self.assertEqual(hs1, xc.HloSharding.iota_tile((2, 2)))
+    self.assertEqual(hs2, xc.HloSharding.iota_tile((2, 2)))
+    self.assertEqual(hs3, xc.HloSharding.iota_tile((4, 2)))
+    self.assertEqual(hs1.num_devices(), 4)
+    self.assertEqual(hs1.num_dimensions(), 2)
+    self.assertEqual(hs1.tile_assignment_dimensions(), [2, 2])
+    self.assertEqual(hs1.tile_assignment_devices(), [0, 1, 2, 3])
+    self.assertTrue(hs1.is_tiled())
+    self.assertFalse(hs1.replicate_on_last_tile_dim())
     self.assertEqual(hash(hs1), hash(hs2))
     self.assertNotEqual(hash(hs1), hash(hs3))
     self.assertNotEqual(hash(hs2), hash(hs3))
@@ -3923,29 +3923,28 @@ class UtilTest(jtu.JaxTestCase):
 
     hs1 = xc.HloSharding.from_proto(op1)
     hs2 = xc.HloSharding.from_proto(op2)
-    if xla_extension_version >= 156:
-      self.assertEqual(
-          hs1,
-          xc.HloSharding.iota_tile(
-              (4, 1),
-              reshape_dims=(2, 2),
-              transpose_perm=(1, 0),
-              subgroup_types=[xc.OpSharding.Type.REPLICATED],
-          ),
-      )
-      self.assertFalse(hs1.subgroup_types())
-      self.assertTrue(hs1.is_tiled())
-      self.assertEqual(
-          hs2,
-          xc.HloSharding.iota_tile(
-              (4, 1),
-              reshape_dims=(2, 2),
-              transpose_perm=(1, 0),
-              subgroup_types=[xc.OpSharding.Type.REPLICATED],
-          ),
-      )
-      self.assertFalse(hs2.subgroup_types())
-      self.assertTrue(hs2.is_tiled())
+    self.assertEqual(
+        hs1,
+        xc.HloSharding.iota_tile(
+            (4, 1),
+            reshape_dims=(2, 2),
+            transpose_perm=(1, 0),
+            subgroup_types=[xc.OpSharding.Type.REPLICATED],
+        ),
+    )
+    self.assertFalse(hs1.subgroup_types())
+    self.assertTrue(hs1.is_tiled())
+    self.assertEqual(
+        hs2,
+        xc.HloSharding.iota_tile(
+            (4, 1),
+            reshape_dims=(2, 2),
+            transpose_perm=(1, 0),
+            subgroup_types=[xc.OpSharding.Type.REPLICATED],
+        ),
+    )
+    self.assertFalse(hs2.subgroup_types())
+    self.assertTrue(hs2.is_tiled())
     self.assertEqual(hash(hs1), hash(hs2))
 
   def test_op_sharding_tuple_shardings(self):
@@ -3976,8 +3975,6 @@ class UtilTest(jtu.JaxTestCase):
     self.assertNotEqual(hash(hs1), hash(hs2))
 
   def test_hlo_sharding_iota_tile_error(self):
-    if xla_extension_version < 156:
-      self.skipTest('Requires xla_extension_version >= 156')
     self.assertRaisesRegex(
         xla_extension.XlaRuntimeError,
         'INVALID_ARGUMENT: `dims` should not be empty.',
@@ -4095,42 +4092,38 @@ class UtilTest(jtu.JaxTestCase):
     self.assertTrue(op_shardings.are_op_shardings_equal(op1, op2))
     self.assertTrue(op_shardings.are_op_shardings_equal(op1, op3))
 
-    if xla_extension_version >= 156:
-      hs1 = xc.HloSharding.from_proto(op1)
-      self.assertEqual(
-          hs1,
-          xc.HloSharding.iota_tile(
-              (1, 1, 2, 1),
-              subgroup_types=(
-                  xc.OpSharding.Type.REPLICATED,
-                  xc.OpSharding.Type.MANUAL,
-              ),
-          )
-      )
-      self.assertTrue(hs1.is_replicated())
-      self.assertFalse(hs1.replicate_on_last_tile_dim())
+    hs1 = xc.HloSharding.from_proto(op1)
+    self.assertEqual(
+        hs1,
+        xc.HloSharding.iota_tile(
+            (1, 1, 2, 1),
+            subgroup_types=(
+                xc.OpSharding.Type.REPLICATED,
+                xc.OpSharding.Type.MANUAL,
+            ),
+        )
+    )
+    self.assertTrue(hs1.is_replicated())
+    self.assertFalse(hs1.replicate_on_last_tile_dim())
 
-      hs2 = xc.HloSharding.from_proto(op2)
-      self.assertEqual(
-          xc.HloSharding.from_proto(op2),
-          xc.HloSharding.iota_tile(
-              (1, 1, 1, 2),
-              subgroup_types=(
-                  xc.OpSharding.Type.MANUAL,
-                  xc.OpSharding.Type.REPLICATED,
-              ),
-          )
-      )
-      self.assertTrue(hs2.is_replicated())
-      self.assertFalse(hs2.replicate_on_last_tile_dim())
-      self.assertEqual(
-          xc.HloSharding.from_proto(op3), xc.HloSharding.replicate()
-      )
+    hs2 = xc.HloSharding.from_proto(op2)
+    self.assertEqual(
+        xc.HloSharding.from_proto(op2),
+        xc.HloSharding.iota_tile(
+            (1, 1, 1, 2),
+            subgroup_types=(
+                xc.OpSharding.Type.MANUAL,
+                xc.OpSharding.Type.REPLICATED,
+            ),
+        )
+    )
+    self.assertTrue(hs2.is_replicated())
+    self.assertFalse(hs2.replicate_on_last_tile_dim())
+    self.assertEqual(
+        xc.HloSharding.from_proto(op3), xc.HloSharding.replicate()
+    )
 
   def test_hlo_sharding_manual_replicated(self):
-    if xla_extension_version < 156:
-      self.skipTest('Requires xla_extension_version >= 156')
-
     hs1 = xc.HloSharding.manual()
     self.assertTrue(hs1.is_manual())
     self.assertFalse(hs1.tile_assignment_devices())
